@@ -1,4 +1,3 @@
-
 from flask import Flask, render_template, request, session, redirect, url_for
 from flask_socketio import join_room, leave_room, send, SocketIO, emit
 import random
@@ -13,6 +12,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///chat_users.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 socketio = SocketIO(app)
+
 # Direct chat page
 @app.route("/chat/<username>")
 def chat(username):
@@ -20,12 +20,11 @@ def chat(username):
         return redirect(url_for('login'))
     if session['name'] == username:
         return redirect(url_for('home'))
-    # Fetch chat history between logged-in user and selected user
     messages = Message.query.filter(
         ((Message.sender == session['name']) & (Message.recipient == username)) |
         ((Message.sender == username) & (Message.recipient == session['name']))
     ).order_by(Message.timestamp).all()
-    return render_template("chat.html", other_user=username, messages=messages)
+    return render_template("chat.html", other_user=username, messages=messages, current_user=session['name'])
 
 # Logout route
 @app.route("/logout")
@@ -33,11 +32,8 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
-
 rooms = {}
-# Track online users: username -> sid
 online_users = {}
-
 
 # User model
 class User(db.Model):
@@ -62,9 +58,9 @@ class Message(db.Model):
     content = db.Column(db.Text, nullable=False)
     timestamp = db.Column(db.DateTime, server_default=func.now())
 
-
 with app.app_context():
     db.create_all()
+
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
@@ -96,13 +92,9 @@ def login():
 
 def generate_unique_code(length):
     while True:
-        code = ""
-        for _ in range(length):
-            code += random.choice(ascii_uppercase)
-        
+        code = "".join(random.choice(ascii_uppercase) for _ in range(length))
         if code not in rooms:
             break
-    
     return code
 
 @app.route("/", methods=["POST", "GET"])
@@ -122,7 +114,7 @@ def home():
             users = User.query.all()
             user_list = [u.username for u in users]
             return render_template("home.html", error="Please enter a room code.", code=code, name=name, users=user_list)
-        
+
         room = code
         if create != False:
             room = generate_unique_code(4)
@@ -131,7 +123,7 @@ def home():
             users = User.query.all()
             user_list = [u.username for u in users]
             return render_template("home.html", error="Room does not exist.", code=code, name=name, users=user_list)
-        
+
         session["room"] = room
         session["name"] = name
         return redirect(url_for("room"))
@@ -140,17 +132,13 @@ def home():
     user_list = [u.username for u in users]
     return render_template("home.html", users=user_list)
 
-
 @app.route("/room")
 def room():
     room = session.get("room")
     if room is None or session.get("name") is None or room not in rooms:
         return redirect(url_for("home"))
-    # Show online users
     users = list(online_users.keys())
     return render_template("room.html", code=room, messages=rooms[room]["messages"], users=users)
-
-# API endpoint to get all users (registered)
 
 @app.route("/users")
 def get_users():
@@ -159,7 +147,6 @@ def get_users():
     filtered_users = [u.username for u in users if u.username != current_user]
     return {"users": filtered_users}
 
-# API endpoint to get chat history between two users
 @app.route("/messages/<user1>/<user2>")
 def get_messages(user1, user2):
     messages = Message.query.filter(
@@ -170,14 +157,10 @@ def get_messages(user1, user2):
         {"sender": m.sender, "recipient": m.recipient, "content": m.content, "timestamp": m.timestamp.strftime('%Y-%m-%d %H:%M:%S')} for m in messages
     ]}
 
-# API endpoint to get online users
 @app.route("/online_users")
 def get_online_users():
     return {"online_users": list(online_users.keys())}
 
-
-
-# Direct message event (store in DB)
 @socketio.on("direct_message")
 def direct_message(data):
     sender = session.get("name")
@@ -185,13 +168,11 @@ def direct_message(data):
     msg = data.get("message")
     if not sender or not recipient or not msg:
         return
-    # Store message in DB
     db.session.add(Message(sender=sender, recipient=recipient, content=msg))
     db.session.commit()
     sid = online_users.get(recipient)
     if sid:
         emit("direct_message", {"from": sender, "message": msg}, room=sid)
-        print(f"{sender} sent direct message to {recipient}: {msg}")
     else:
         emit("direct_message", {"from": "system", "message": f"User {recipient} is not online."}, room=online_users.get(sender))
 
@@ -200,14 +181,9 @@ def message(data):
     room = session.get("room")
     if room not in rooms:
         return 
-    content = {
-        "name": session.get("name"),
-        "message": data["data"]
-    }
+    content = {"name": session.get("name"), "message": data["data"]}
     send(content, to=room)
     rooms[room]["messages"].append(content)
-    print(f"{session.get('name')} said: {data['data']}")
-
 
 @socketio.on("connect")
 def connect(auth):
@@ -218,24 +194,19 @@ def connect(auth):
     if room not in rooms:
         leave_room(room)
         return
-    # Register user in DB if not exists
     if not User.query.filter_by(username=name).first():
         db.session.add(User(username=name))
         db.session.commit()
-    # Track online user
     online_users[name] = request.sid
     join_room(room)
     send({"name": name, "message": "has entered the room"}, to=room)
     rooms[room]["members"] += 1
-    print(f"{name} joined room {room}")
-
 
 @socketio.on("disconnect")
 def disconnect():
     room = session.get("room")
     name = session.get("name")
     leave_room(room)
-    # Remove from online users
     if name in online_users:
         del online_users[name]
     if room in rooms:
@@ -243,7 +214,6 @@ def disconnect():
         if rooms[room]["members"] <= 0:
             del rooms[room]
     send({"name": name, "message": "has left the room"}, to=room)
-    print(f"{name} has left the room {room}")
 
 if __name__ == "__main__":
     import os
