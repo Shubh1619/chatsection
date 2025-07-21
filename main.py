@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func, or_
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from starlette.middleware.sessions import SessionMiddleware
+from contextlib import asynccontextmanager
 import uvicorn
 import bcrypt
 
@@ -21,12 +22,19 @@ app.add_middleware(
 
 # --------------------- Database Setup ---------------------
 DATABASE_URL = 'postgresql://neondb_owner:npg_caB9Uq2oVHfT@ep-wandering-salad-a1li69y8-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
-engine = create_engine(DATABASE_URL)  # ✅ Fixed line
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-
 def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@asynccontextmanager
+async def lifespan_db():
     db = SessionLocal()
     try:
         yield db
@@ -76,15 +84,21 @@ class ChatManager:
     async def connect(self, websocket: WebSocket, username: str):
         await websocket.accept()
         self.active_connections[username] = websocket
+        print(f"[CONNECTED] {username}")
 
     def disconnect(self, username: str):
         self.active_connections.pop(username, None)
+        print(f"[DISCONNECTED] {username}")
 
     async def store_and_send(self, db: Session, sender: str, recipient: str, message: str):
+        print(f"[MESSAGE] {sender} → {recipient}: {message}")
         db.add(Message(sender=sender, recipient=recipient, content=message))
         db.commit()
+
         if recipient in self.active_connections:
             await self.active_connections[recipient].send_json({"from": sender, "message": message})
+        if sender in self.active_connections:
+            await self.active_connections[sender].send_json({"from": "You", "message": message})
 
 chat_manager = ChatManager()
 
@@ -99,7 +113,11 @@ def home(request: Request, db: Session = Depends(get_db)):
     if not username:
         return RedirectResponse("/login")
     users = db.query(User).filter(User.username != username).all()
-    return templates.TemplateResponse("home.html", {"request": request, "users": [u.username for u in users], "session": request.session})
+    return templates.TemplateResponse("home.html", {
+        "request": request,
+        "users": [u.username for u in users],
+        "session": request.session
+    })
 
 @app.get("/register", response_class=HTMLResponse)
 def register_form(request: Request):
@@ -150,16 +168,21 @@ def chat(username: str, request: Request, db: Session = Depends(get_db)):
 @app.websocket("/ws/chat/{recipient}")
 async def websocket_endpoint(websocket: WebSocket, recipient: str):
     username = websocket.query_params.get("username")
+    if not username:
+        await websocket.close(code=1008)
+        return
+
     await chat_manager.connect(websocket, username)
-    db = next(get_db())
-    try:
-        while True:
-            data = await websocket.receive_json()
-            sender = data.get("from")
-            message = data.get("message")
-            await chat_manager.store_and_send(db, sender, recipient, message)
-    except WebSocketDisconnect:
-        chat_manager.disconnect(username)
+
+    async with lifespan_db() as db:
+        try:
+            while True:
+                data = await websocket.receive_json()
+                sender = data.get("from")
+                message = data.get("message")
+                await chat_manager.store_and_send(db, sender, recipient, message)
+        except WebSocketDisconnect:
+            chat_manager.disconnect(username)
 
 # --------------------- Start App ---------------------
 if __name__ == "__main__":
