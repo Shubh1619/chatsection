@@ -1,221 +1,192 @@
-from flask import Flask, render_template, request, session, redirect, url_for
-from flask_socketio import join_room, leave_room, send, SocketIO, emit
-import random
-from string import ascii_uppercase
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func
-from werkzeug.security import generate_password_hash, check_password_hash
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, Depends
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func, or_
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from starlette.middleware.sessions import SessionMiddleware
+from cryptography.fernet import Fernet
+import uvicorn
+import bcrypt
 
-app = Flask(__name__)
-app.config["SECRET_KEY"] = "hjhjsdahhds"
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///chat_users.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-db = SQLAlchemy(app)
-socketio = SocketIO(app)
+# --------------------- App Setup ---------------------
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key="supersecret")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Direct chat page
-@app.route("/chat/<username>")
-def chat(username):
-    if 'name' not in session or not session['name']:
-        return redirect(url_for('login'))
-    if session['name'] == username:
-        return redirect(url_for('home'))
-    messages = Message.query.filter(
-        ((Message.sender == session['name']) & (Message.recipient == username)) |
-        ((Message.sender == username) & (Message.recipient == session['name']))
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# --------------------- Database Setup ---------------------
+DATABASE_URL = 'postgresql://neondb_owner:npg_caB9Uq2oVHfT@ep-wandering-salad-a1li69y8-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --------------------- Encryption Setup ---------------------
+fernet_key = Fernet.generate_key()  # You should store this in an environment variable or config file
+cipher = Fernet(fernet_key)
+
+def encrypt_message(message: str) -> str:
+    return cipher.encrypt(message.encode()).decode()
+
+def decrypt_message(token: str) -> str:
+    return cipher.decrypt(token.encode()).decode()
+
+# --------------------- Models ---------------------
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(80), unique=True, nullable=False)
+    password_hash = Column(String(128), nullable=False)
+
+    def verify_password(self, password: str) -> bool:
+        return bcrypt.checkpw(password.encode(), self.password_hash.encode())
+
+class Message(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True)
+    sender = Column(String(80), nullable=False)
+    recipient = Column(String(80), nullable=False)
+    content = Column(Text, nullable=False)
+    timestamp = Column(DateTime, server_default=func.now())
+
+Base.metadata.create_all(bind=engine)
+
+# --------------------- Auth Helpers ---------------------
+def create_user(db: Session, username: str, password: str):
+    hashed_pw = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    user = User(username=username, password_hash=hashed_pw)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+def authenticate_user(db: Session, username: str, password: str):
+    user = db.query(User).filter(User.username == username).first()
+    if user and user.verify_password(password):
+        return user
+    return None
+
+# --------------------- Chat Manager ---------------------
+class ChatManager:
+    def __init__(self):
+        self.active_connections: dict[str, WebSocket] = {}
+
+    async def connect(self, websocket: WebSocket, username: str):
+        await websocket.accept()
+        self.active_connections[username] = websocket
+
+    def disconnect(self, username: str):
+        self.active_connections.pop(username, None)
+
+    async def store_and_send(self, db: Session, sender: str, recipient: str, message: str):
+        encrypted = encrypt_message(message)
+        db.add(Message(sender=sender, recipient=recipient, content=encrypted))
+        db.commit()
+
+        # Send decrypted message to both sender and recipient if connected
+        if recipient in self.active_connections:
+            await self.active_connections[recipient].send_json({"from": sender, "message": message})
+        if sender in self.active_connections:
+            await self.active_connections[sender].send_json({"from": "You", "message": message})
+
+chat_manager = ChatManager()
+
+# --------------------- Routes ---------------------
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request, db: Session = Depends(get_db)):
+    username = request.session.get("username")
+    if not username:
+        return RedirectResponse("/login")
+    users = db.query(User).filter(User.username != username).all()
+    return templates.TemplateResponse("home.html", {
+        "request": request,
+        "users": [u.username for u in users],
+        "session": request.session
+    })
+
+@app.get("/register", response_class=HTMLResponse)
+def register_form(request: Request):
+    return templates.TemplateResponse("register.html", {"request": request})
+
+@app.post("/register")
+def register(request: Request, username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    if db.query(User).filter(User.username == username).first():
+        return templates.TemplateResponse("register.html", {"request": request, "error": "Username already exists."})
+    create_user(db, username, password)
+    return RedirectResponse("/login", status_code=302)
+
+@app.get("/login", response_class=HTMLResponse)
+def login_form(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request})
+
+@app.post("/login")
+def login(request: Request, username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    user = authenticate_user(db, username, password)
+    if not user:
+        return templates.TemplateResponse("login.html", {"request": request, "error": "Invalid username or password."})
+    request.session["username"] = username
+    return RedirectResponse("/", status_code=302)
+
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=302)
+
+@app.get("/chat/{username}", response_class=HTMLResponse)
+def chat(username: str, request: Request, db: Session = Depends(get_db)):
+    current_user = request.session.get("username")
+    if not current_user or current_user == username:
+        return RedirectResponse("/", status_code=302)
+    messages = db.query(Message).filter(
+        or_(
+            (Message.sender == current_user) & (Message.recipient == username),
+            (Message.sender == username) & (Message.recipient == current_user)
+        )
     ).order_by(Message.timestamp).all()
-    return render_template("chat.html", other_user=username, messages=messages, current_user=session['name'])
 
-# Logout route
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
+    # Decrypt before display
+    for msg in messages:
+        try:
+            msg.content = decrypt_message(msg.content)
+        except Exception:
+            msg.content = "[Encrypted]"
+    return templates.TemplateResponse("chat.html", {
+        "request": request,
+        "other_user": username,
+        "messages": messages,
+        "current_user": current_user
+    })
 
-rooms = {}
-online_users = {}
+@app.websocket("/ws/chat/{recipient}")
+async def websocket_endpoint(websocket: WebSocket, recipient: str):
+    username = websocket.query_params.get("username")
+    await chat_manager.connect(websocket, username)
+    db = next(get_db())
+    try:
+        while True:
+            data = await websocket.receive_json()
+            sender = data.get("from")
+            message = data.get("message")
+            await chat_manager.store_and_send(db, sender, recipient, message)
+    except WebSocketDisconnect:
+        chat_manager.disconnect(username)
 
-# User model
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(128), nullable=False)
-
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
-
-    def __repr__(self):
-        return f"<User {self.username}>"
-
-# Message model
-class Message(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    sender = db.Column(db.String(80), nullable=False)
-    recipient = db.Column(db.String(80), nullable=False)
-    content = db.Column(db.Text, nullable=False)
-    timestamp = db.Column(db.DateTime, server_default=func.now())
-
-with app.app_context():
-    db.create_all()
-
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
-        if not username or not password:
-            return render_template("register.html", error="Please provide username and password.")
-        if User.query.filter_by(username=username).first():
-            return render_template("register.html", error="Username already exists.")
-        user = User(username=username)
-        user.set_password(password)
-        db.session.add(user)
-        db.session.commit()
-        return redirect(url_for("login"))
-    return render_template("register.html")
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
-        user = User.query.filter_by(username=username).first()
-        if user and user.check_password(password):
-            session["name"] = username
-            return redirect(url_for("home"))
-        else:
-            return render_template("login.html", error="Invalid username or password.")
-    return render_template("login.html")
-
-def generate_unique_code(length):
-    while True:
-        code = "".join(random.choice(ascii_uppercase) for _ in range(length))
-        if code not in rooms:
-            break
-    return code
-
-@app.route("/", methods=["POST", "GET"])
-def home():
-    if request.method == "POST":
-        name = request.form.get("name")
-        code = request.form.get("code")
-        join = request.form.get("join", False)
-        create = request.form.get("create", False)
-
-        if not name:
-            users = User.query.all()
-            user_list = [u.username for u in users]
-            return render_template("home.html", error="Please enter a name.", code=code, name=name, users=user_list)
-
-        if join != False and not code:
-            users = User.query.all()
-            user_list = [u.username for u in users]
-            return render_template("home.html", error="Please enter a room code.", code=code, name=name, users=user_list)
-
-        room = code
-        if create != False:
-            room = generate_unique_code(4)
-            rooms[room] = {"members": 0, "messages": []}
-        elif code not in rooms:
-            users = User.query.all()
-            user_list = [u.username for u in users]
-            return render_template("home.html", error="Room does not exist.", code=code, name=name, users=user_list)
-
-        session["room"] = room
-        session["name"] = name
-        return redirect(url_for("room"))
-
-    users = User.query.all()
-    user_list = [u.username for u in users]
-    return render_template("home.html", users=user_list)
-
-@app.route("/room")
-def room():
-    room = session.get("room")
-    if room is None or session.get("name") is None or room not in rooms:
-        return redirect(url_for("home"))
-    users = list(online_users.keys())
-    return render_template("room.html", code=room, messages=rooms[room]["messages"], users=users)
-
-@app.route("/users")
-def get_users():
-    current_user = session.get('name')
-    users = User.query.all()
-    filtered_users = [u.username for u in users if u.username != current_user]
-    return {"users": filtered_users}
-
-@app.route("/messages/<user1>/<user2>")
-def get_messages(user1, user2):
-    messages = Message.query.filter(
-        ((Message.sender == user1) & (Message.recipient == user2)) |
-        ((Message.sender == user2) & (Message.recipient == user1))
-    ).order_by(Message.timestamp).all()
-    return {"messages": [
-        {"sender": m.sender, "recipient": m.recipient, "content": m.content, "timestamp": m.timestamp.strftime('%Y-%m-%d %H:%M:%S')} for m in messages
-    ]}
-
-@app.route("/online_users")
-def get_online_users():
-    return {"online_users": list(online_users.keys())}
-
-@socketio.on("direct_message")
-def direct_message(data):
-    sender = session.get("name")
-    recipient = data.get("to")
-    msg = data.get("message")
-    if not sender or not recipient or not msg:
-        return
-    db.session.add(Message(sender=sender, recipient=recipient, content=msg))
-    db.session.commit()
-    sid = online_users.get(recipient)
-    if sid:
-        emit("direct_message", {"from": sender, "message": msg}, room=sid)
-    else:
-        emit("direct_message", {"from": "system", "message": f"User {recipient} is not online."}, room=online_users.get(sender))
-
-@socketio.on("message")
-def message(data):
-    room = session.get("room")
-    if room not in rooms:
-        return 
-    content = {"name": session.get("name"), "message": data["data"]}
-    send(content, to=room)
-    rooms[room]["messages"].append(content)
-
-@socketio.on("connect")
-def connect(auth):
-    room = session.get("room")
-    name = session.get("name")
-    if not room or not name:
-        return
-    if room not in rooms:
-        leave_room(room)
-        return
-    if not User.query.filter_by(username=name).first():
-        db.session.add(User(username=name))
-        db.session.commit()
-    online_users[name] = request.sid
-    join_room(room)
-    send({"name": name, "message": "has entered the room"}, to=room)
-    rooms[room]["members"] += 1
-
-@socketio.on("disconnect")
-def disconnect():
-    room = session.get("room")
-    name = session.get("name")
-    leave_room(room)
-    if name in online_users:
-        del online_users[name]
-    if room in rooms:
-        rooms[room]["members"] -= 1
-        if rooms[room]["members"] <= 0:
-            del rooms[room]
-    send({"name": name, "message": "has left the room"}, to=room)
-
+# --------------------- Run Server ---------------------
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
