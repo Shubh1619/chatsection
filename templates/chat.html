@@ -5,7 +5,10 @@
 <div class="card">
     <div class="card-body" id="chat-box" style="height: 400px; overflow-y: auto;">
         {% for msg in messages %}
-            <div><strong>{{ msg.sender }}:</strong> {{ msg.content }} <span class="text-muted small">{{ msg.timestamp.strftime('%Y-%m-%d %H:%M') }}</span></div>
+            <div>
+                <strong>{{ msg.sender }}:</strong> {{ msg.content }}
+                <span class="text-muted small">{{ msg.timestamp.strftime('%Y-%m-%d %H:%M') }}</span>
+            </div>
         {% endfor %}
     </div>
     <div class="card-footer">
@@ -17,11 +20,18 @@
         </form>
     </div>
 </div>
+
 <script>
-    const socket = new WebSocket(`ws://${location.host}/ws/chat/{{ other_user }}?username={{ current_user }}`);
+    const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${wsProtocol}://${location.host}/ws/chat/{{ other_user }}?username={{ current_user }}`);
+
     const chatBox = document.getElementById("chat-box");
     const chatForm = document.getElementById("chat-form");
     const chatInput = document.getElementById("chat-input");
+
+    socket.onopen = () => console.log("✅ WebSocket connected");
+    socket.onclose = () => console.log("❌ WebSocket closed");
+    socket.onerror = (e) => console.error("⚠️ WebSocket error", e);
 
     socket.onmessage = function(event) {
         const data = JSON.parse(event.data);
@@ -31,21 +41,20 @@
         chatBox.scrollTop = chatBox.scrollHeight;
     };
 
-chatForm.addEventListener("submit", function(e) {
-    e.preventDefault();
-    const message = chatInput.value.trim();
-    if (message !== "") {
-        socket.send(JSON.stringify({ from: "{{ current_user }}", message: message }));
-        
-        // Show sender's message immediately
-        const div = document.createElement("div");
-        div.innerHTML = `<strong>You:</strong> ${message}`;
-        chatBox.appendChild(div);
-        chatBox.scrollTop = chatBox.scrollHeight;
+    chatForm.addEventListener("submit", function(e) {
+        e.preventDefault();
+        const message = chatInput.value.trim();
+        if (message !== "") {
+            socket.send(JSON.stringify({ from: "{{ current_user }}", message: message }));
 
-        chatInput.value = "";
-    }
-});
+            // Show sender's message immediately
+            const div = document.createElement("div");
+            div.innerHTML = `<strong>You:</strong> ${message}`;
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
 
+            chatInput.value = "";
+        }
+    });
 </script>
 {% endblock %}
