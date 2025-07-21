@@ -32,27 +32,40 @@
         </div>
     </div>
 </div>
+
 <script>
     var socket = io();
     var chatForm = document.getElementById('chat-form');
     var chatInput = document.getElementById('chat-input');
     var chatBox = document.getElementById('chat-box');
     var otherUser = "{{ other_user }}";
+    var currentUser = "{{ session['name'] }}";  // current logged-in user
 
     chatForm.addEventListener('submit', function(e) {
         e.preventDefault();
-        var msg = chatInput.value;
-        if (msg.trim() !== '') {
+        var msg = chatInput.value.trim();
+        if (msg !== '') {
             socket.emit('direct_message', {to: otherUser, message: msg});
+
+            // Show sent message immediately
+            var div = document.createElement('div');
+            div.innerHTML = '<strong>You:</strong> ' + msg + ' <span class="text-muted small">(just now)</span>';
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+
             chatInput.value = '';
         }
     });
 
     socket.on('direct_message', function(data) {
         var div = document.createElement('div');
-        div.innerHTML = '<strong>' + data.from + ':</strong> ' + data.message;
-        chatBox.appendChild(div);
-        chatBox.scrollTop = chatBox.scrollHeight;
+
+        // Avoid duplicating message if it's from the current user
+        if (data.from !== currentUser) {
+            div.innerHTML = '<strong>' + data.from + ':</strong> ' + data.message;
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
     });
 </script>
 </body>
