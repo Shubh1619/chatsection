@@ -8,7 +8,6 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from starlette.middleware.sessions import SessionMiddleware
 import uvicorn
 import bcrypt
-import hashlib
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="supersecret")
@@ -22,9 +21,10 @@ app.add_middleware(
 
 # --------------------- Database Setup ---------------------
 DATABASE_URL = 'postgresql://neondb_owner:npg_caB9Uq2oVHfT@ep-wandering-salad-a1li69y8-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL)  # ✅ Fixed line
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()
@@ -53,7 +53,7 @@ class Message(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --------------------- Helpers ---------------------
+# --------------------- Auth Helpers ---------------------
 def create_user(db: Session, username: str, password: str):
     hashed_pw = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     user = User(username=username, password_hash=hashed_pw)
@@ -68,9 +68,6 @@ def authenticate_user(db: Session, username: str, password: str):
         return user
     return None
 
-def hash_message(message: str) -> str:
-    return hashlib.sha256(message.encode()).hexdigest()
-
 # --------------------- Chat Manager ---------------------
 class ChatManager:
     def __init__(self):
@@ -84,15 +81,10 @@ class ChatManager:
         self.active_connections.pop(username, None)
 
     async def store_and_send(self, db: Session, sender: str, recipient: str, message: str):
-        hashed = hash_message(message)
-        db.add(Message(sender=sender, recipient=recipient, content=hashed))
+        db.add(Message(sender=sender, recipient=recipient, content=message))
         db.commit()
-        # Send to recipient
         if recipient in self.active_connections:
             await self.active_connections[recipient].send_json({"from": sender, "message": message})
-        # Send to sender (for confirmation)
-        if sender in self.active_connections:
-            await self.active_connections[sender].send_json({"from": "You", "message": message})
 
 chat_manager = ChatManager()
 
@@ -107,11 +99,7 @@ def home(request: Request, db: Session = Depends(get_db)):
     if not username:
         return RedirectResponse("/login")
     users = db.query(User).filter(User.username != username).all()
-    return templates.TemplateResponse("home.html", {
-        "request": request,
-        "users": [u.username for u in users],
-        "session": request.session
-    })
+    return templates.TemplateResponse("home.html", {"request": request, "users": [u.username for u in users], "session": request.session})
 
 @app.get("/register", response_class=HTMLResponse)
 def register_form(request: Request):
@@ -132,9 +120,9 @@ def login_form(request: Request):
 def login(request: Request, username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
     user = authenticate_user(db, username, password)
     if not user:
-        return templates.TemplateResponse("login.html", {"request": request, "error": "Invalid credentials"})
+        return templates.TemplateResponse("login.html", {"request": request, "error": "Invalid username or password."})
     request.session["username"] = username
-    return RedirectResponse("/", status_code=302)
+    return RedirectResponse(url="/", status_code=302)
 
 @app.get("/logout")
 def logout(request: Request):
@@ -145,7 +133,7 @@ def logout(request: Request):
 def chat(username: str, request: Request, db: Session = Depends(get_db)):
     current_user = request.session.get("username")
     if not current_user or current_user == username:
-        return RedirectResponse("/", status_code=302)
+        return RedirectResponse(url="/", status_code=302)
     messages = db.query(Message).filter(
         or_(
             (Message.sender == current_user) & (Message.recipient == username),
